@@ -1,0 +1,107 @@
+from airflow import DAG
+from airflow.operators.python_operator import PythonOperator
+from datetime import datetime, timedelta
+import happybase
+import json
+from confluent_kafka import Consumer, KafkaException
+
+def process_kafka_message(message):
+    value = message.value().decode('utf-8')
+    print('Received message: {}'.format(value))
+
+    data = json.loads(value)
+
+    row_key = data['shcode'] + data['chetime']
+
+    connection = happybase.Connection(host='172.23.0.1', port=5050)
+    table = connection.table('stock_tick')
+
+    if b'stock_tick' not in connection.tables():
+        connection.close()
+        raise Exception("HBase table not found")
+
+    if table.row(row_key.encode()):
+        print(f"Row with key {row_key} already exists. Skipping insertion.")
+        
+    else:
+        table.put(row_key.encode(), {
+            b'cf1:system_time': str(data['system_time']).encode(),
+            b'cf1:shcode': data['shcode'].encode(),
+            b'cf1:chetime': data['chetime'].encode(),
+            b'cf1:sign': data['sign'].encode(),
+            b'cf1:change': data['change'].encode(),
+            b'cf1:drate': data['drate'].encode(),
+            b'cf1:price': data['price'].encode(),
+            b'cf1:opentime': data['opentime'].encode(),
+            b'cf1:open': data['open'].encode(),
+            b'cf1:hightime': data['hightime'].encode(),
+            b'cf1:high': data['high'].encode(),
+            b'cf1:lowtime': data['lowtime'].encode(),
+            b'cf1:low': data['low'].encode(),
+            b'cf1:cgubun': data['cgubun'].encode(),
+            b'cf1:cvolume': data['cvolume'].encode(),
+            b'cf1:volume': data['volume'].encode(),
+            b'cf1:value': data['value'].encode(),
+            b'cf1:mdvolume': data['mdvolume'].encode(),
+            b'cf1:mdchecnt': data['mdchecnt'].encode(),
+            b'cf1:msvolume': data['msvolume'].encode(),
+            b'cf1:mschecnt': data['mschecnt'].encode(),
+            b'cf1:cpower': data['cpower'].encode(),
+            b'cf1:w_avrg': data['w_avrg'].encode(),
+            b'cf1:offerho': data['offerho'].encode(),
+            b'cf1:bidho': data['bidho'].encode(),
+            b'cf1:status': data['status'].encode(),
+            b'cf1:jnilvolume': data['jnilvolume'].encode()
+        })
+
+    connection.close()
+
+    
+def consume_kafka_messages():
+    conf = {
+        'bootstrap.servers': 'kafka:9092',
+        'group.id': 'stockbackup',
+    }
+
+    consumer = Consumer(conf)
+    consumer.subscribe(['stock_tick'])
+
+    end_time = datetime.now() + timedelta(minutes=5)
+
+    while datetime.now() < end_time:
+        msg = consumer.poll(10)
+
+        if msg is None:
+            print("No message received.")
+            return
+        if msg.error():
+            raise KafkaException(msg.error())
+        else:
+            process_kafka_message(msg)
+
+def check_time():
+    now = datetime.now()
+    return (now.hour > 8 or (now.hour == 8 and now.minute >= 40)) and now.hour < 18
+
+default_args = {
+    'owner': 'kafka_to_hbase_dag',
+    'depends_on_past': False,
+    'start_date': datetime(2023, 10, 31),
+    'retries': 0,
+    'retry_delay': timedelta(minutes=5),
+}
+
+dag = DAG(
+    'kafka_to_hbase_dag',
+    default_args=default_args,
+    description='Consume Kafka messages and store in HBase',
+    catchup=False,
+    schedule_interval=timedelta(minutes=5),
+)
+
+consume_task = PythonOperator(
+    task_id='consume_kafka_messages',
+    python_callable=consume_kafka_messages,
+    provide_context=True,
+    dag=dag,
+)
